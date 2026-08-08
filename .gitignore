@@ -1,0 +1,10 @@
+# Build output - shipped as a GitHub Release instead of committed
+bin/
+obj/
+*.pdb
+
+# Editors / OS
+.vs/
+.idea/
+Thumbs.db
+desktop.ini
