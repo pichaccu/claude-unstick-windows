@@ -142,43 +142,193 @@ namespace ClaudeKiller
 
             // 2. Kill everything Claude-owned, re-scanning so children spawned
             //    during the service stop are caught too.
-            int killed = KillAll(info);
-            Say("Kilott folyamatok: " + killed);
+            Say("Kilott folyamatok: " + KillAll(info));
 
             // 3. Stale single-instance and update locks are what produce the
             //    "already running" lie once the processes are actually gone.
-            int cleaned = CleanLocks(info);
-            Say("Torolt lock fajlok: " + cleaned);
+            Say("Torolt lock fajlok: " + CleanLocks(info));
 
-            // 4. Relaunch. An MSIX app cannot be started from its WindowsApps
-            //    path - it has to go through the AppUserModelId.
-            bool launched = Activate(info);
-            if (!launched)
-            {
-                Say("HIBA: a Claude Desktop inditasa nem sikerult.");
-                StartService();
-                Report("Claude Killer - az inditas nem sikerult", MessageBoxIcon.Error);
-                return 1;
-            }
+            // 4. Escalating repair. Each rung is verified by actually watching for
+            //    a new process; the first one that works wins and the rest never
+            //    run. Nothing here assumes why the previous rung failed.
+            if (TryActivateAndVerify(info, "alaphelyzet"))
+                return Finish(serviceWasPresent, true);
 
-            // 5. Bring the service back only after the app is up, so it does not
-            //    re-lock the package while a pending update is applying.
-            bool up = WaitForApp(info);
+            if (RepairRegistration(ref info) && TryActivateAndVerify(info, "ujraregisztralas utan"))
+                return Finish(serviceWasPresent, true);
+
+            if (KillSafeHolders(info) > 0 && TryActivateAndVerify(info, "zarolok kilovese utan"))
+                return Finish(serviceWasPresent, true);
+
+            Say("");
+            Say("HIBA: a Claude egyik javitasi lepes utan sem indult el.");
+            ReportEvidence(info, FindTargets(info));
+            AdviseFinalSteps(info);
+            return Finish(serviceWasPresent, false);
+        }
+
+        // ---------------------------------------------------------------- repair ladder
+
+        private static int Finish(bool serviceWasPresent, bool ok)
+        {
             if (serviceWasPresent) StartService();
 
-            if (!up)
+            if (ok)
             {
-                Say("HIBA: nem indult el uj Claude folyamat " + (VerifyTimeoutMs / 1000) + " masodpercen belul.");
-                // The assumption "a Claude process holds the lock" just failed.
-                // Collect the evidence that says what actually does.
-                ReportEvidence(info, targets);
-                Report("Claude Killer - a Claude nem jott fel", MessageBoxIcon.Error);
-                return 1;
+                Say("KESZ - a Claude ujraindult.");
+                if (Verbose) Report("Claude Killer - kesz", MessageBoxIcon.Information);
+                return 0;
             }
 
-            Say("KESZ - a Claude ujraindult.");
-            if (Verbose) Report("Claude Killer - kesz", MessageBoxIcon.Information);
-            return 0;
+            Report("Claude Killer - nem sikerult", MessageBoxIcon.Error);
+            return 1;
+        }
+
+        private static bool TryActivateAndVerify(Install info, string label)
+        {
+            Say("");
+            Say("-- probalkozas: " + label + " --");
+            if (!Activate(info)) return false;
+            bool up = WaitForApp(info);
+            Say(up ? "  sikerult" : "  nem jott fel " + (VerifyTimeoutMs / 1000) + " masodperc alatt");
+            return up;
+        }
+
+        // Re-registers the package for the current user. This is the repair for a
+        // half-applied update: the files are on disk but the registration is
+        // broken or points at a version that is not really there. No admin needed
+        // - a user may re-register a package that is already installed for them.
+        private static bool RepairRegistration(ref Install info)
+        {
+            Say("");
+            Say("-- csomag ujraregisztralasa --");
+
+            string result = RunPowerShell(
+                "$p = Get-AppxPackage -Name Claude*; " +
+                "if (-not $p) { 'ERR: nincs regisztralt Claude csomag' } else { " +
+                "foreach ($x in $p) { try { " +
+                "Add-AppxPackage -DisableDevelopmentMode -Register ($x.InstallLocation + '\\AppxManifest.xml') -ForceApplicationShutdown; " +
+                "'OK ' + $x.PackageFullName } catch { 'ERR: ' + $_.Exception.Message } } }");
+
+            foreach (string line in result.Split('\n'))
+            {
+                string s = line.Trim();
+                if (s.Length > 0) Say("  " + s);
+            }
+
+            // Registration may now resolve to a different version, so the identity
+            // has to be re-derived before the next activation attempt.
+            info = Discover();
+            Say("  azonossag most: " + (info.PackageFullName.Length > 0 ? info.PackageFullName : "(nincs)") +
+                " | AUMID forrasa: " + info.AumidSource);
+
+            return info.Aumid.Length > 0;
+        }
+
+        private static readonly Regex SecuritySoftware = new Regex(
+            @"defender|msmpeng|mssense|sense(ir|ndr|cn)|falcon|crowdstrike|sentinel|carbonblack|cbdefense|" +
+            @"cylance|sophos|symantec|mcafee|mfe|trendmicro|tmccsf|kaspersky|avp\b|eset|ekrn|bitdefender|" +
+            @"norton|webroot|tanium|qualys|nessus|forcepoint|netskope|zscaler|xagt|fireeye",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        // Only touches things that are plainly ours to touch. Security agents,
+        // system services and other users' sessions are named, never killed -
+        // terminating those would be both wrong and useless.
+        private static string WhyNotSafeToKill(Holder h, int mySession)
+        {
+            if (h.Service.Length > 0 && !string.Equals(h.Service, ServiceName, StringComparison.OrdinalIgnoreCase))
+                return "windows szolgaltatas";
+
+            if (h.SessionId != (uint)mySession)
+                return "masik munkamenet (session " + h.SessionId + ")";
+
+            if (SecuritySoftware.IsMatch(h.App) || (h.Path.Length > 0 && SecuritySoftware.IsMatch(h.Path)))
+                return "biztonsagi szoftver";
+
+            if (h.Path.Length > 0)
+            {
+                string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+                if (h.Path.StartsWith(win + "\\", StringComparison.OrdinalIgnoreCase))
+                    return "rendszerfolyamat";
+            }
+            else return "az utvonala nem olvashato";
+
+            return "";
+        }
+
+        private static int KillSafeHolders(Install info)
+        {
+            Say("");
+            Say("-- ki fogja meg mindig a fajlokat --");
+
+            string err;
+            List<Holder> holders = WhoHoldsFiles(PackageFilesToProbe(info), out err);
+            if (err.Length > 0) Say("  " + err);
+            if (holders.Count == 0) { Say("  (senki lathato)"); return 0; }
+
+            int mySession = Process.GetCurrentProcess().SessionId;
+            int killed = 0;
+
+            foreach (Holder h in holders)
+            {
+                if (h.Pid == OwnPid) continue;
+
+                string why = WhyNotSafeToKill(h, mySession);
+                if (why.Length > 0)
+                {
+                    Say("  [" + h.Pid + "] " + h.App + " - NEM bantom: " + why);
+                    continue;
+                }
+
+                try
+                {
+                    Process p = Process.GetProcessById(h.Pid);
+                    p.Kill();
+                    p.WaitForExit(ProcessExitWaitMs);
+                    killed++;
+                    Say("  [" + h.Pid + "] " + h.App + " kilove");
+                }
+                catch (ArgumentException) { }
+                catch (Exception ex) { Say("  [" + h.Pid + "] " + h.App + " nem lott ki: " + ex.Message); }
+            }
+
+            Say("  kilott zarolok: " + killed);
+            return killed;
+        }
+
+        // When every rung failed, say what specifically is in the way rather than
+        // offering a generic "try rebooting".
+        private static void AdviseFinalSteps(Install info)
+        {
+            Say("");
+            Say("== MI A TEENDO ==");
+
+            if (!info.PackageRegistered || info.Aumid.Length == 0)
+            {
+                Say("  A csomag nincs ervenyesen regisztralva ehhez a felhasznalohoz.");
+                Say("  Telepitsd ujra a Claude Desktopot a claude.ai/download oldalrol.");
+                Say("  (Vegso esetben, ADATVESZTESSEL: Get-AppxPackage -Name Claude* | Reset-AppxPackage)");
+                return;
+            }
+
+            string err;
+            List<Holder> holders = WhoHoldsFiles(PackageFilesToProbe(info), out err);
+            int mySession = Process.GetCurrentProcess().SessionId;
+            List<Holder> blocked = holders.Where(h => WhyNotSafeToKill(h, mySession).Length > 0).ToList();
+
+            if (blocked.Count > 0)
+            {
+                Say("  A csomagot olyan program fogja, amihez nem nyulok:");
+                foreach (Holder h in blocked)
+                    Say("    - " + h.App + " (" + WhyNotSafeToKill(h, mySession) + ")");
+                Say("  Ha ez biztonsagi szoftver, a rendszergazda tud ra kivetelt tenni a");
+                Say("  WindowsApps\\Claude_* mappara. Addig a gep ujrainditasa segit.");
+                return;
+            }
+
+            Say("  Nem talaltam blokkolo folyamatot, megsem indul. Valoszinuleg a");
+            Say("  Windows csomagtelepitoje van felfuggesztett allapotban - a gep");
+            Say("  ujrainditasa ezt tisztitja. Ha ujraindulas utan is all, telepitsd ujra.");
         }
 
         // ---------------------------------------------------------------- discovery
@@ -205,36 +355,153 @@ namespace ClaudeKiller
 
             // The service's ImagePath is readable by every user and survives even
             // when no Claude process is alive, so it is the most reliable anchor.
+            // Step 1 - find the family name. Any source will do; the family part is
+            // stable across versions, unlike the full name.
+            string hintDir = "";
             string svcExe = ReadServiceImagePath();
-            if (svcExe.Length > 0)
-            {
-                info.PackageDir = PackageRootOf(svcExe);
-                if (info.PackageDir.Length > 0) info.IdentitySource = "szolgaltatas ImagePath (regisztracio)";
-            }
+            if (svcExe.Length > 0) hintDir = PackageRootOf(svcExe);
 
-            if (info.PackageDir.Length == 0)
+            if (hintDir.Length == 0)
             {
                 foreach (Proc p in EnumerateProcesses())
                 {
                     string root = PackageRootOf(p.Path);
-                    if (root.Length > 0)
+                    if (root.Length > 0) { hintDir = root; break; }
+                }
+            }
+
+            string family = hintDir.Length > 0 ? FamilyFromFullName(Path.GetFileName(hintDir)) : "";
+            if (family.Length == 0) family = FamilyFromRegistry();
+
+            // Step 2 - ask which package of that family is REGISTERED. During an
+            // update the service ImagePath already points at the new version while
+            // only the old one is still registered; activating the new identity
+            // then fails with ERROR_CANCELLED. Registration is the authority.
+            if (family.Length > 0)
+            {
+                info.PackageFamilyName = family;
+                List<string> registered = RegisteredPackages(family);
+
+                foreach (string fullName in registered)
+                {
+                    info.PackageFullName = fullName;
+                    info.Aumid = ResolveAumid(info);
+                    if (info.AumidResolved)
                     {
-                        info.PackageDir = root;
-                        info.IdentitySource = "futo folyamat utvonala";
+                        info.IdentitySource = "regisztralt csomag (FindPackagesByPackageFamily)";
+                        info.PackageDir = InstallDirOf(fullName, hintDir);
                         break;
                     }
                 }
             }
 
-            if (info.PackageDir.Length > 0)
+            // Step 3 - nothing registered resolved; fall back to the hint so the
+            // process-killing and lock-clearing work still runs.
+            if (!info.AumidResolved && hintDir.Length > 0)
             {
-                info.PackageFullName = Path.GetFileName(info.PackageDir);
+                info.PackageDir = hintDir;
+                info.PackageFullName = Path.GetFileName(hintDir);
                 info.PackageFamilyName = FamilyFromFullName(info.PackageFullName);
+                info.IdentitySource = "szolgaltatas ImagePath (nincs regisztralt csomag)";
                 info.Aumid = ResolveAumid(info);
             }
 
+            if (info.PackageDir.Length == 0 && hintDir.Length > 0) info.PackageDir = hintDir;
+
             info.ServiceState = QueryServiceState();
             return info;
+        }
+
+        // Registered package full names for a family, newest first. Pure Win32, no
+        // admin, no PowerShell - and unlike the service registry entry it only ever
+        // reports packages that can actually be activated.
+        private static List<string> RegisteredPackages(string familyName)
+        {
+            List<string> names = new List<string>();
+            try
+            {
+                uint count = 0, bufLen = 0;
+                int rc = Native.FindPackagesByPackageFamily(familyName,
+                    Native.PACKAGE_FILTER_HEAD | Native.PACKAGE_FILTER_DIRECT,
+                    ref count, IntPtr.Zero, ref bufLen, IntPtr.Zero, IntPtr.Zero);
+
+                if (rc == Native.ERROR_INSUFFICIENT_BUFFER && count > 0)
+                {
+                    IntPtr namePtrs = Marshal.AllocHGlobal((int)count * IntPtr.Size);
+                    IntPtr buffer = Marshal.AllocHGlobal((int)bufLen * 2);
+                    IntPtr props = Marshal.AllocHGlobal((int)count * sizeof(uint));
+                    try
+                    {
+                        rc = Native.FindPackagesByPackageFamily(familyName,
+                            Native.PACKAGE_FILTER_HEAD | Native.PACKAGE_FILTER_DIRECT,
+                            ref count, namePtrs, ref bufLen, buffer, props);
+                        if (rc == 0)
+                        {
+                            for (int i = 0; i < count; i++)
+                            {
+                                IntPtr p = Marshal.ReadIntPtr(namePtrs, i * IntPtr.Size);
+                                string n = Marshal.PtrToStringUni(p);
+                                if (!string.IsNullOrEmpty(n)) names.Add(n);
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(namePtrs);
+                        Marshal.FreeHGlobal(buffer);
+                        Marshal.FreeHGlobal(props);
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            names.Reverse(); // highest version first
+            return names;
+        }
+
+        // Family name without any running process or service to go on.
+        private static string FamilyFromRegistry()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Classes\ActivatableClasses\Package"))
+                {
+                    if (k != null)
+                    {
+                        foreach (string sub in k.GetSubKeyNames())
+                        {
+                            if (sub.StartsWith("Claude_", StringComparison.OrdinalIgnoreCase))
+                            {
+                                string fam = FamilyFromFullName(sub);
+                                if (fam.Length > 0) return fam;
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            // Publisher hash is stable for a given signing identity.
+            return "Claude_pzs8sxrjxfjjc";
+        }
+
+        private static string InstallDirOf(string fullName, string hintDir)
+        {
+            if (hintDir.Length > 0)
+            {
+                string parent = Path.GetDirectoryName(hintDir);
+                if (!string.IsNullOrEmpty(parent))
+                {
+                    string candidate = Path.Combine(parent, fullName);
+                    if (Directory.Exists(candidate)) return candidate;
+                }
+            }
+            string guess = Path.Combine(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "WindowsApps"),
+                fullName);
+            return Directory.Exists(guess) ? guess : hintDir;
         }
 
         // C:\Program Files\WindowsApps\Claude_1.2_x64__abc\app\Claude.exe
@@ -869,16 +1136,28 @@ namespace ClaudeKiller
             return false;
         }
 
+        // Accepts any Claude package process, not just the version we expected -
+        // a repaired registration may legitimately come back on a different one.
         private static bool WaitForApp(Install info)
         {
-            if (info.PackageDir.Length == 0) return true;
             Stopwatch sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < VerifyTimeoutMs)
             {
                 foreach (Proc p in EnumerateProcesses())
                 {
                     if (p.Pid == OwnPid) continue;
-                    if (p.Path.StartsWith(info.PackageDir + "\\", StringComparison.OrdinalIgnoreCase))
+
+                    if (p.Path.Length > 0)
+                    {
+                        if (PackageRootOf(p.Path).Length > 0) return true;
+                        if (info.PackageDir.Length > 0 &&
+                            p.Path.StartsWith(info.PackageDir + "\\", StringComparison.OrdinalIgnoreCase))
+                            return true;
+                    }
+
+                    // Legacy, unpackaged install: no package path to match on.
+                    if (info.PackageDir.Length == 0 &&
+                        string.Equals(p.Name, "claude", StringComparison.OrdinalIgnoreCase))
                         return true;
                 }
                 System.Threading.Thread.Sleep(750);
@@ -1121,6 +1400,17 @@ namespace ClaudeKiller
 
         [DllImport("kernel32.dll")]
         internal static extern int GetPackageApplicationIds(IntPtr packageInfoReference, ref uint bufferLength, IntPtr buffer, out uint count);
+
+        // Lists the packages actually REGISTERED for this user - as opposed to
+        // whatever the service's ImagePath still points at, which during an update
+        // is the new version that is not registered yet.
+        internal const uint PACKAGE_FILTER_HEAD = 0x00000010;
+        internal const uint PACKAGE_FILTER_DIRECT = 0x00000020;
+        internal const int ERROR_INSUFFICIENT_BUFFER = 122;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        internal static extern int FindPackagesByPackageFamily(string packageFamilyName, uint packageFilters,
+            ref uint count, IntPtr packageFullNames, ref uint bufferLength, IntPtr buffer, IntPtr packageProperties);
 
         // Restart Manager - the API installers use to answer "which programs are
         // using these files". Works without admin for same-session processes and

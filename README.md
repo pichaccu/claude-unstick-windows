@@ -70,6 +70,24 @@ This is why people hunting for stale lock files never find them in the obvious p
 and why processes have to be matched on their true image path. The bundled Claude Code
 CLI lives inside the package container too.
 
+## Identity comes from what is registered, not from what the service claims
+
+This one is worth calling out, because getting it wrong is what made the first
+version fail on a machine mid-update.
+
+The obvious place to learn which package you are dealing with is the service's
+registered `ImagePath`. During an update that value **already points at the new
+version**, while only the old one is still registered and activatable. Derive the
+AppUserModelId from it and `ActivateApplication` returns `0x800704C7`
+(`ERROR_CANCELLED`) — Windows is being asked to start something that does not exist
+yet.
+
+So the package identity is resolved with `FindPackagesByPackageFamily`, which only
+ever reports packages actually **registered** for the current user, and the AUMID is
+read out of the package with `GetPackageApplicationIds` rather than assembled from a
+naming convention. If that read ever fails, the report says so in as many words
+instead of quietly guessing.
+
 ## What the tool does
 
 1. Discovers the package, its AUMID and the service state **at runtime** — nothing is
@@ -95,6 +113,30 @@ CLI lives inside the package container too.
 
 If stopping the service is ever denied on a differently-hardened machine, the tool
 relaunches itself elevated. On a normal install that never happens.
+
+### The repair ladder
+
+Freeing the locks is not always enough, so the repair escalates. **Every rung is
+verified by watching for a real process** — nothing is assumed to have worked, and
+the first rung that succeeds ends the run:
+
+| Rung | Action | Fixes |
+|---|---|---|
+| 1 | stop service, kill processes, clear locks, activate | orphaned processes and stale locks |
+| 2 | re-register the package for the current user (`Add-AppxPackage -Register … -ForceApplicationShutdown`) | a half-applied update whose registration is broken |
+| 3 | Restart Manager → kill the remaining lock holders that are safe to kill | a non-Claude holder that is plainly yours |
+
+Rung 2 needs no admin: a user may re-register a package already installed for them,
+and the manifest under `WindowsApps` is readable without elevation.
+
+Rung 3 is deliberately conservative. It **never** kills security software, Windows
+services, processes under `%WINDIR%`, or anything in another session — those get
+named in the report instead, because terminating them would be both wrong and
+useless. If one of those is the blocker, the tool tells you which, so an
+administrator can add the right exclusion rather than guess.
+
+When every rung fails, the report states what specifically is in the way instead of
+suggesting a reboot as a reflex.
 
 ## Usage
 
@@ -173,17 +215,25 @@ stuck machine but not executed end-to-end from inside the session that wrote it,
 because doing so terminates that session. `--diagnose` exists so you can confirm
 detection on your own machine before letting it act.
 
-### Known open case
+Version 2.0.0 additionally verified: registered-package identity resolution
+(`FindPackagesByPackageFamily` agrees with `Get-AppxPackage`), activation through
+the resolved AUMID, non-admin readability of the `WindowsApps` manifest that rung 2
+depends on, and the shape of the re-registration command.
 
-On at least one managed corporate machine the tool stopped the service successfully
-without admin — confirming the SDDL finding above — but found **no Claude processes
-at all**, while Windows still reported the package file as in use, and activation
-failed with `0x800704C7`.
+### Honest limits
 
-That is a **different root cause** from the one this tool was built for: the lock
-holder is not a Claude process. Version 1.1.0 adds the Restart Manager and package
-identity diagnostics specifically to identify it, rather than guessing at a fix.
-If you hit this, please open an issue with the `--diagnose` report attached.
+The mid-update failure that motivated version 2.0.0 was reproduced on a managed
+corporate machine but could not be re-tested there afterwards. Rung 2 targets the
+root cause identified from that machine's output — an identity taken from the
+service's `ImagePath` while a different package was the registered one — and rungs 1
+and 3 cover the alternatives. That reasoning is sound and each piece is individually
+verified, but the full ladder has not been observed rescuing that specific machine.
+
+Rung 2 has not been executed end-to-end either: running it re-registers the package
+and force-closes Claude, which on the development machine would terminate the
+session doing the testing. Its precondition and command shape were verified instead.
+
+If it fails for you, `--diagnose` names the blocker — please open an issue with it.
 
 ## License
 
