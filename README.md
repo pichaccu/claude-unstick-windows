@@ -114,7 +114,27 @@ Run from a terminal and the output goes to the console instead of a dialog.
 
 Exit codes: `0` success, `1` the fix did not work, `2` unexpected error.
 
-**Start with `--diagnose` on a machine you care about.** It touches nothing.
+**Start with `--diagnose` on a machine you care about.** It touches nothing, writes a
+full report to `%TEMP%\claude-killer-diagnose.txt` and opens it.
+
+The report answers the questions that actually matter when the simple case does not
+apply:
+
+- **Who really holds the package files** — via the Restart Manager API
+  (`RmStartSession`/`RmGetList`), the same mechanism installers use for
+  *"the following applications are using files that need to be updated"*. It names
+  processes **and services**, across sessions, without admin. If the lock holder is
+  antivirus, an indexer, or another user's session, this is what says so.
+- **Whether the package identity is real or guessed.** The tool derives the package
+  from the service's registered `ImagePath`. If `OpenPackageInfoByFullName` then
+  fails, the AUMID is *constructed* rather than read, and activating it returns
+  `0x800704C7` (`ERROR_CANCELLED`). The report labels this explicitly instead of
+  hiding it.
+- **What is actually registered** — `Get-AppxPackage` version and `Status`. A
+  mismatch against the service's `ImagePath` means a half-applied update, which is a
+  different failure from a mere file lock.
+
+The same evidence block is printed automatically whenever a repair attempt fails.
 
 ## Building
 
@@ -152,6 +172,18 @@ The destructive path (stop → kill → clean → relaunch) was developed agains
 stuck machine but not executed end-to-end from inside the session that wrote it,
 because doing so terminates that session. `--diagnose` exists so you can confirm
 detection on your own machine before letting it act.
+
+### Known open case
+
+On at least one managed corporate machine the tool stopped the service successfully
+without admin — confirming the SDDL finding above — but found **no Claude processes
+at all**, while Windows still reported the package file as in use, and activation
+failed with `0x800704C7`.
+
+That is a **different root cause** from the one this tool was built for: the lock
+holder is not a Claude process. Version 1.1.0 adds the Restart Manager and package
+identity diagnostics specifically to identify it, rather than guessing at a fix.
+If you hit this, please open an issue with the `--diagnose` report attached.
 
 ## License
 

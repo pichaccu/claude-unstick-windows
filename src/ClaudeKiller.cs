@@ -110,9 +110,24 @@ namespace ClaudeKiller
                     Say("  [" + p.Pid + "] " + p.Name + " path='" + p.Path + "'" +
                         (targets.Any(t => t.Pid == p.Pid) ? " -> CEL" : " -> kihagyva"));
                 }
+                ReportEvidence(info, targets);
                 Say("");
                 Say("DIAGNOSZTIKA MOD - semmi nem lett modositva.");
+
+                // This report is far too long for a dialog. Put it in a file and
+                // open it, so it can be read, saved and pasted somewhere.
+                bool opened = false;
+                if (LogFile.Length == 0)
+                {
+                    LogFile = Path.Combine(Path.GetTempPath(), "claude-killer-diagnose.txt");
+                    opened = true;
+                }
                 Report("Claude Killer - diagnosztika", MessageBoxIcon.Information);
+                if (opened)
+                {
+                    try { Process.Start("notepad.exe", "\"" + LogFile + "\""); }
+                    catch (Exception) { }
+                }
                 return 0;
             }
 
@@ -154,6 +169,9 @@ namespace ClaudeKiller
             if (!up)
             {
                 Say("HIBA: nem indult el uj Claude folyamat " + (VerifyTimeoutMs / 1000) + " masodpercen belul.");
+                // The assumption "a Claude process holds the lock" just failed.
+                // Collect the evidence that says what actually does.
+                ReportEvidence(info, targets);
                 Report("Claude Killer - a Claude nem jott fel", MessageBoxIcon.Error);
                 return 1;
             }
@@ -172,6 +190,13 @@ namespace ClaudeKiller
             public string PackageFamilyName = "";
             public string Aumid = "";
             public string ServiceState = "hianyzik";
+
+            // Provenance, so a failure can be told apart from a lucky guess.
+            public string IdentitySource = "ismeretlen";
+            public readonly List<string> AllAumids = new List<string>();
+            public bool PackageRegistered;      // OpenPackageInfoByFullName succeeded
+            public bool AumidResolved;          // read from the package, not constructed
+            public string AumidSource = "nincs";
         }
 
         private static Install Discover()
@@ -181,14 +206,23 @@ namespace ClaudeKiller
             // The service's ImagePath is readable by every user and survives even
             // when no Claude process is alive, so it is the most reliable anchor.
             string svcExe = ReadServiceImagePath();
-            if (svcExe.Length > 0) info.PackageDir = PackageRootOf(svcExe);
+            if (svcExe.Length > 0)
+            {
+                info.PackageDir = PackageRootOf(svcExe);
+                if (info.PackageDir.Length > 0) info.IdentitySource = "szolgaltatas ImagePath (regisztracio)";
+            }
 
             if (info.PackageDir.Length == 0)
             {
                 foreach (Proc p in EnumerateProcesses())
                 {
                     string root = PackageRootOf(p.Path);
-                    if (root.Length > 0) { info.PackageDir = root; break; }
+                    if (root.Length > 0)
+                    {
+                        info.PackageDir = root;
+                        info.IdentitySource = "futo folyamat utvonala";
+                        break;
+                    }
                 }
             }
 
@@ -196,7 +230,7 @@ namespace ClaudeKiller
             {
                 info.PackageFullName = Path.GetFileName(info.PackageDir);
                 info.PackageFamilyName = FamilyFromFullName(info.PackageFullName);
-                info.Aumid = ResolveAumid(info.PackageFullName, info.PackageFamilyName);
+                info.Aumid = ResolveAumid(info);
             }
 
             info.ServiceState = QueryServiceState();
@@ -221,14 +255,21 @@ namespace ClaudeKiller
             return fullName.Substring(0, first) + "_" + fullName.Substring(last + 2);
         }
 
-        private static string ResolveAumid(string fullName, string familyName)
+        private static string ResolveAumid(Install info)
         {
+            string fullName = info.PackageFullName;
+            string familyName = info.PackageFamilyName;
+
             // Preferred: ask the package model itself. Works without admin.
+            // If this fails the identity is stale - the registration points at a
+            // package that is no longer really there, which is exactly what a
+            // half-applied update looks like.
             try
             {
                 IntPtr pir;
                 if (Native.OpenPackageInfoByFullName(fullName, 0, out pir) == 0)
                 {
+                    info.PackageRegistered = true;
                     try
                     {
                         uint len = 0, count = 0;
@@ -240,9 +281,18 @@ namespace ClaudeKiller
                             {
                                 if (Native.GetPackageApplicationIds(pir, ref len, buf, out count) == 0 && count > 0)
                                 {
-                                    IntPtr first = Marshal.ReadIntPtr(buf, 0);
-                                    string id = Marshal.PtrToStringUni(first);
-                                    if (!string.IsNullOrEmpty(id)) return id;
+                                    for (int i = 0; i < count; i++)
+                                    {
+                                        IntPtr sp = Marshal.ReadIntPtr(buf, i * IntPtr.Size);
+                                        string extra = Marshal.PtrToStringUni(sp);
+                                        if (!string.IsNullOrEmpty(extra)) info.AllAumids.Add(extra);
+                                    }
+                                    if (info.AllAumids.Count > 0)
+                                    {
+                                        info.AumidResolved = true;
+                                        info.AumidSource = "csomagbol kiolvasva";
+                                        return info.AllAumids[0];
+                                    }
                                 }
                             }
                             finally { Marshal.FreeHGlobal(buf); }
@@ -271,7 +321,9 @@ namespace ClaudeKiller
             }
             catch (Exception) { }
 
-            // Last resort: the conventional application id for this package.
+            // Last resort: the conventional application id. This is a GUESS - if the
+            // package is not properly registered, activating it yields ERROR_CANCELLED.
+            info.AumidSource = "TALALGATAS (a csomagot nem lehetett megnyitni)";
             return familyName.Length > 0 ? familyName + "!Claude" : "";
         }
 
@@ -634,6 +686,11 @@ namespace ClaudeKiller
                         waiting.Add(p);
                         killed++;
                     }
+                    catch (ArgumentException)
+                    {
+                        // Already gone - normally because stopping the service took
+                        // it down first. Not a problem, not worth reporting.
+                    }
                     catch (Exception ex)
                     {
                         // cowork-svc runs as LocalSystem; stopping the service is
@@ -829,6 +886,161 @@ namespace ClaudeKiller
             return false;
         }
 
+        // ---------------------------------------------------------------- who holds the file
+
+        private sealed class Holder
+        {
+            public int Pid;
+            public string App = "";
+            public string Service = "";
+            public uint SessionId;
+            public string Path = "";
+        }
+
+        // Asks Windows directly which processes hold the package files, instead of
+        // assuming they must be Claude's.
+        private static List<Holder> WhoHoldsFiles(List<string> files, out string error)
+        {
+            List<Holder> holders = new List<Holder>();
+            error = "";
+
+            if (files.Count == 0) { error = "nincs vizsgalhato fajl"; return holders; }
+
+            uint session;
+            StringBuilder key = new StringBuilder(Native.CCH_RM_SESSION_KEY + 1);
+            int rc = Native.RmStartSession(out session, 0, key);
+            if (rc != 0) { error = "RmStartSession hiba " + rc; return holders; }
+
+            try
+            {
+                rc = Native.RmRegisterResources(session, (uint)files.Count, files.ToArray(), 0, null, 0, null);
+                if (rc != 0) { error = "RmRegisterResources hiba " + rc; return holders; }
+
+                uint needed = 0, count = 0, reasons = 0;
+                rc = Native.RmGetList(session, out needed, ref count, null, out reasons);
+
+                if (rc == Native.ERROR_MORE_DATA && needed > 0)
+                {
+                    Native.RM_PROCESS_INFO[] info = new Native.RM_PROCESS_INFO[needed];
+                    count = needed;
+                    rc = Native.RmGetList(session, out needed, ref count, info, out reasons);
+                    if (rc == 0)
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            Holder h = new Holder();
+                            h.Pid = info[i].Process.dwProcessId;
+                            h.App = info[i].strAppName;
+                            h.Service = info[i].strServiceShortName;
+                            h.SessionId = info[i].TSSessionId;
+                            h.Path = ImagePathOf(h.Pid);
+                            holders.Add(h);
+                        }
+                    }
+                    else error = "RmGetList hiba " + rc;
+                }
+                else if (rc != 0) error = "RmGetList hiba " + rc;
+            }
+            finally { Native.RmEndSession(session); }
+
+            return holders;
+        }
+
+        private static List<string> PackageFilesToProbe(Install info)
+        {
+            List<string> files = new List<string>();
+            if (info.PackageDir.Length == 0) return files;
+
+            string app = Path.Combine(info.PackageDir, "app");
+            files.Add(Path.Combine(app, "Claude.exe"));
+            files.Add(Path.Combine(app, "resources", "cowork-svc.exe"));
+            files.Add(Path.Combine(info.PackageDir, "AppxManifest.xml"));
+
+            // WindowsApps normally denies directory listing to non-admins; if it
+            // happens to work, probe a wider set.
+            try
+            {
+                foreach (string f in Directory.GetFiles(app, "*.dll", SearchOption.TopDirectoryOnly))
+                {
+                    files.Add(f);
+                    if (files.Count > 40) break;
+                }
+            }
+            catch (Exception) { }
+
+            return files.Where(f => { try { return File.Exists(f); } catch (Exception) { return false; } }).ToList();
+        }
+
+        private static string RunPowerShell(string command)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("powershell.exe",
+                    "-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + command.Replace("\"", "\\\"") + "\"");
+                psi.UseShellExecute = false;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    string outText = p.StandardOutput.ReadToEnd();
+                    string errText = p.StandardError.ReadToEnd();
+                    p.WaitForExit(30000);
+                    return (outText + errText).Trim();
+                }
+            }
+            catch (Exception ex) { return "(nem futtathato: " + ex.Message + ")"; }
+        }
+
+        private static void ReportEvidence(Install info, List<Target> targets)
+        {
+            Say("");
+            Say("== CSOMAG AZONOSSAG ==");
+            Say("  honnan:            " + info.IdentitySource);
+            Say("  csomagmappa letezik: " + Directory.Exists(info.PackageDir));
+            Say("  csomag regisztralt: " + (info.PackageRegistered ? "IGEN" : "NEM  <-- gyanus"));
+            Say("  AUMID forrasa:     " + info.AumidSource);
+            if (info.AllAumids.Count > 0) Say("  osszes AUMID:      " + string.Join(", ", info.AllAumids.ToArray()));
+
+            Say("");
+            Say("== REGISZTRALT CLAUDE CSOMAGOK (Get-AppxPackage) ==");
+            string pkgs = RunPowerShell(
+                "Get-AppxPackage -Name Claude* | ForEach-Object { '  ' + $_.PackageFullName + ' | Status=' + $_.Status + ' | Install=' + $_.InstallLocation }");
+            Say(pkgs.Length > 0 ? pkgs : "  (nincs talalat - a csomag nincs regisztralva ehhez a felhasznalohoz)");
+
+            Say("");
+            Say("== KI FOGJA A CSOMAG FAJLJAIT (Restart Manager) ==");
+            List<string> probe = PackageFilesToProbe(info);
+            Say("  vizsgalt fajlok: " + probe.Count);
+            string rmError;
+            List<Holder> holders = WhoHoldsFiles(probe, out rmError);
+            if (rmError.Length > 0) Say("  " + rmError);
+            if (holders.Count == 0) Say("  (egyetlen lathato folyamat sem fogja - lehet mas felhasznalo vagy kernel szintu zar)");
+            foreach (Holder h in holders)
+            {
+                Say("  [" + h.Pid + "] " + h.App +
+                    (h.Service.Length > 0 ? " (szolgaltatas: " + h.Service + ")" : "") +
+                    " session=" + h.SessionId);
+                if (h.Path.Length > 0) Say("        " + h.Path);
+            }
+
+            Say("");
+            Say("== MUNKAMENET ==");
+            Say("  sajat session: " + Process.GetCurrentProcess().SessionId);
+            Say("  admin: " + IsAdmin());
+        }
+
+        private static bool IsAdmin()
+        {
+            try
+            {
+                System.Security.Principal.WindowsPrincipal wp =
+                    new System.Security.Principal.WindowsPrincipal(System.Security.Principal.WindowsIdentity.GetCurrent());
+                return wp.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+            }
+            catch (Exception) { return false; }
+        }
+
         // ---------------------------------------------------------------- output
 
         private static void Say(string line)
@@ -909,6 +1121,53 @@ namespace ClaudeKiller
 
         [DllImport("kernel32.dll")]
         internal static extern int GetPackageApplicationIds(IntPtr packageInfoReference, ref uint bufferLength, IntPtr buffer, out uint count);
+
+        // Restart Manager - the API installers use to answer "which programs are
+        // using these files". Works without admin for same-session processes and
+        // reports services too, which is the only honest way to find a lock
+        // holder that is not a Claude process at all.
+        internal const int CCH_RM_SESSION_KEY = 32;
+        internal const int CCH_RM_MAX_APP_NAME = 255;
+        internal const int CCH_RM_MAX_SVC_NAME = 63;
+        internal const int ERROR_MORE_DATA = 234;
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct RM_UNIQUE_PROCESS
+        {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct RM_PROCESS_INFO
+        {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+            public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+            public string strServiceShortName;
+            public int ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bRestartable;
+        }
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        internal static extern int RmStartSession(out uint sessionHandle, int sessionFlags, StringBuilder sessionKey);
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        internal static extern int RmRegisterResources(uint sessionHandle,
+            uint nFiles, string[] rgsFilenames,
+            uint nApplications, RM_UNIQUE_PROCESS[] rgApplications,
+            uint nServices, string[] rgsServiceNames);
+
+        [DllImport("rstrtmgr.dll")]
+        internal static extern int RmGetList(uint sessionHandle, out uint procInfoNeeded,
+            ref uint procInfo, [In, Out] RM_PROCESS_INFO[] processInfo, out uint rebootReasons);
+
+        [DllImport("rstrtmgr.dll")]
+        internal static extern int RmEndSession(uint sessionHandle);
 
         internal enum ActivateOptions
         {
