@@ -140,8 +140,38 @@ suggesting a reboot as a reflex.
 
 ## Usage
 
+### The script — recommended, and the only option on a locked-down machine
+
+[`claude-repair.ps1`](claude-repair.ps1) does the same job using **only built-in
+PowerShell cmdlets**. No compiled code, no `Add-Type`, nothing to install.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File claude-repair.ps1
+```
+
+Use this one if you are on a work machine. There is no binary for antivirus to
+flag, and an administrator can read the whole thing before allowing it — which is a
+realistic ask, unlike "please add an exception for this unsigned .exe from GitHub".
+
+`-Diagnose` reports and changes nothing. `-KeepCli` leaves running Claude Code CLI
+sessions alone. The shell running the script, and everything it descends from, is
+never terminated — so it always survives to finish the repair.
+
+If Windows refuses to run the downloaded file, clear the Mark of the Web:
+
+```powershell
+Unblock-File .\claude-repair.ps1
+```
+
+### The executable — for convenience
+
 Download `claude-repair.exe` from [Releases](../../releases) and double-click it.
 It runs **silently** and only shows a window if something went wrong.
+
+It does slightly more than the script — Restart Manager lock-holder detection and
+Win32 package APIs — but it is a signed-by-nobody binary, so see
+[Signing and antivirus false positives](#signing-and-antivirus-false-positives)
+before deploying it anywhere managed.
 
 | Flag | Behaviour |
 |---|---|
@@ -185,7 +215,14 @@ to a textbook machine-learning false positive. Windows Defender has flagged this
 on at least one machine. It is a false positive — the whole source is in this repo,
 it is ~1000 lines, and you can build it yourself in one command.
 
-Here is what actually helps, in order of how much good it does:
+**The honest answer to this problem is not to ship a binary at all.** Asking people
+to whitelist an unsigned executable does not work: nobody does it for a random tool,
+and on a corporate machine nobody *can*. That is why
+[`claude-repair.ps1`](claude-repair.ps1) exists and is the recommended path — plain
+text, readable before it runs, nothing to flag.
+
+If you do want the executable, here is what actually helps, in order of how much
+good it does:
 
 **1. Real file metadata — done, in the binary.** Company, product, description and
 version are populated from `src/AssemblyInfo.cs`, and the build fails if they are
