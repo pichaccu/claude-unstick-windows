@@ -140,7 +140,7 @@ suggesting a reboot as a reflex.
 
 ## Usage
 
-Download `claude-killer.exe` from [Releases](../../releases) and double-click it.
+Download `claude-repair.exe` from [Releases](../../releases) and double-click it.
 It runs **silently** and only shows a window if something went wrong.
 
 | Flag | Behaviour |
@@ -178,16 +178,68 @@ apply:
 
 The same evidence block is printed automatically whenever a repair attempt fails.
 
+## Signing and antivirus false positives
+
+A small, unsigned .NET binary that terminates processes and stops a service is close
+to a textbook machine-learning false positive. Windows Defender has flagged this tool
+on at least one machine. It is a false positive — the whole source is in this repo,
+it is ~1000 lines, and you can build it yourself in one command.
+
+Here is what actually helps, in order of how much good it does:
+
+**1. Real file metadata — done, in the binary.** Company, product, description and
+version are populated from `src/AssemblyInfo.cs`, and the build fails if they are
+missing. An unsigned binary with `FileVersion 0.0.0.0` and no company name is far
+more likely to be flagged than an identical one carrying proper metadata.
+
+**2. Report it to Microsoft — free, and the only thing that fixes it everywhere.**
+Submit the binary at
+[microsoft.com/wdsi/filesubmission](https://www.microsoft.com/en-us/wdsi/filesubmission)
+as a **software developer**, category *"Incorrectly detected as malware"*. Turnaround
+is usually 24–72 hours, after which the verdict is corrected in the cloud for every
+Defender installation — including managed corporate ones you cannot touch yourself.
+**This is the fix for a corporate machine.**
+
+**3. Authenticode signature.** `build.ps1 -Sign` signs the binary with a self-signed
+certificate created in your own user store — no admin needed — and timestamps it via
+DigiCert so the signature outlives the certificate.
+
+Be clear about what a self-signed signature buys you: **nothing, on a machine that
+does not trust the certificate.** It does not make Defender's heuristics stand down,
+and it does not silence SmartScreen for other people. It only helps on machines where
+you deliberately install the certificate, via `trust-cert.ps1` — read the warning at
+the top of that script first, because it makes the machine trust everything signed
+with that key.
+
+A signature that helps *everyone* needs a real certificate from a public CA. For a
+public MIT-licensed project like this one, Certum's open-source code signing
+certificate is the cheap route (roughly €30/year); an OV certificate from Sectigo or
+DigiCert runs into the hundreds. Sign with the same `-Sign` flow, pointing
+`-CertSubject` at the purchased certificate.
+
+**4. Expect SmartScreen on first download regardless.** A binary downloaded from
+GitHub carries the Mark of the Web, so Windows shows *"Windows protected your PC"*
+until the file builds reputation. **More info → Run anyway**, or clear the mark with:
+
+```powershell
+Unblock-File .\claude-repair.exe
+```
+
+What this project will not do is obfuscate, pack, or otherwise dress the binary up to
+slip past a scanner. Those techniques are themselves what scanners look for, and
+hiding from security software is not a thing a repair tool should do.
+
 ## Building
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 -Shortcut
+powershell -ExecutionPolicy Bypass -File build.ps1 -Sign -Shortcut
 ```
 
 Compiles with the `csc.exe` that ships inside Windows (.NET Framework 4.x), so
-**nothing has to be installed** — no SDK, no NuGet, no runtime. Output is a ~25 KB
-dependency-free executable at `bin\claude-killer.exe`. `-Shortcut` drops a shortcut
-on the Desktop.
+**nothing has to be installed** — no SDK, no NuGet, no runtime. Output is a ~39 KB
+dependency-free executable at `bin\claude-repair.exe`. `-Sign` adds a timestamped
+Authenticode signature, `-Shortcut` drops a shortcut on the Desktop. Both are
+optional; a bare `build.ps1` just compiles.
 
 To deploy elsewhere, copy the single `.exe`.
 
