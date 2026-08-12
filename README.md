@@ -114,6 +114,14 @@ instead of quietly guessing.
 If stopping the service is ever denied on a differently-hardened machine, the tool
 relaunches itself elevated. On a normal install that never happens.
 
+### Output language
+
+English by default, Hungarian on a Hungarian Windows, chosen from the OS UI
+culture. Force it with `--lang en|hu` (executable) or `-Language en|hu` (script).
+Code, identifiers and comments are English-only; all translated text lives in
+[`src/Messages.cs`](src/Messages.cs) and the `$Strings` table at the top of the
+script. Adding a language means appending a column — nothing else changes.
+
 ### The repair ladder
 
 Freeing the locks is not always enough, so the repair escalates. **Every rung is
@@ -123,20 +131,39 @@ the first rung that succeeds ends the run:
 | Rung | Action | Fixes |
 |---|---|---|
 | 1 | stop service, kill processes, clear locks, activate | orphaned processes and stale locks |
-| 2 | re-register the package for the current user (`Add-AppxPackage -Register … -ForceApplicationShutdown`) | a half-applied update whose registration is broken |
-| 3 | Restart Manager → kill the remaining lock holders that are safe to kill | a non-Claude holder that is plainly yours |
+| 2 | register any unhealthy package dependency, activate | a framework package the main package's `Status=Ok` says nothing about |
+| 3 | re-register the package for the current user (`Add-AppxPackage -Register … -ForceApplicationShutdown`) | a half-applied update whose registration is broken |
+| 4 | Restart Manager → release the remaining lock holders, activate | a holder that is plainly yours, including our own service |
 
-Rung 2 needs no admin: a user may re-register a package already installed for them,
-and the manifest under `WindowsApps` is readable without elevation.
+Rungs 2 and 3 need no admin: a user may re-register a package already installed for
+them, and the manifest under `WindowsApps` is readable without elevation.
 
-Rung 3 is deliberately conservative. It **never** kills security software, Windows
+**Re-registration restarts the service** — and that service is exactly what holds the
+package files. Rung 3 therefore stops it again before the next activation attempt.
+Missing that made an earlier version undo its own repair.
+
+Rung 4 is deliberately conservative. It **never** kills security software, Windows
 services, processes under `%WINDIR%`, or anything in another session — those get
 named in the report instead, because terminating them would be both wrong and
-useless. If one of those is the blocker, the tool tells you which, so an
-administrator can add the right exclusion rather than guess.
+useless. The one exception is `CoworkVMService` itself: it runs as `LocalSystem` and
+so reports session 0, which an earlier version misread as "another session" and
+refused to touch — the one holder that actually mattered. It is now recognised as
+ours and *stopped* rather than killed, which is the operation a normal user is
+allowed to perform on it.
 
 When every rung fails, the report states what specifically is in the way instead of
-suggesting a reboot as a reflex.
+suggesting a reboot as a reflex. It includes the last `Get-AppxLog` deployment
+errors, which usually name the real reason outright, and two things that are
+invisible from the package's own `Status`:
+
+- **`SignatureKind`.** Claude's MSIX is `Developer`-signed. On a machine where
+  sideloading is disabled by policy (`AllowAllTrustedApps = 0` under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock`), a
+  Developer-signed package will not activate at all — no amount of unlocking files
+  changes that, and only an administrator can lift it.
+- **Dependency health.** A framework dependency in a bad state blocks activation
+  while the main package still reports `Status=Ok`. Claude currently declares no
+  dependencies, so this is reported rather than assumed.
 
 ## Usage
 

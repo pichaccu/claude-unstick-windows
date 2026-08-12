@@ -1,4 +1,4 @@
-// Version resource for the executable.
+﻿// Version resource for the executable.
 //
 // This is not cosmetic. An unsigned, few-tens-of-kilobytes .NET binary with no
 // company, no description and FileVersion 0.0.0.0 that terminates processes and
@@ -20,6 +20,6 @@ using System.Runtime.InteropServices;
 
 [assembly: ComVisible(false)]
 
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
-[assembly: AssemblyInformationalVersion("2.1.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyInformationalVersion("2.3.0")]

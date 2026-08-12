@@ -24,6 +24,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sources = @(
     (Join-Path $root 'src\ClaudeKiller.cs')
+    (Join-Path $root 'src\Messages.cs')
     (Join-Path $root 'src\AssemblyInfo.cs')
 )
 $manifest = Join-Path $root 'src\app.manifest'

@@ -22,6 +22,9 @@
     Authenticated Users SERVICE_START and SERVICE_STOP - check it yourself with
     "sc.exe sdshow CoworkVMService" and look for RP and WP in the (…;;;AU) entry.
 
+    Output is English by default and Hungarian on a Hungarian Windows. Override
+    with -Language en|hu.
+
 .PARAMETER Diagnose
     Report what was found and change nothing.
 
@@ -29,6 +32,9 @@
     Leave running Claude Code CLI sessions alone. By default they are terminated
     too, because a stuck update means everything has to let go of the package.
     The session running this script is never killed either way.
+
+.PARAMETER Language
+    Force the output language: en or hu.
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File claude-repair.ps1
@@ -44,12 +50,96 @@
 [CmdletBinding()]
 param(
     [switch]$Diagnose,
-    [switch]$KeepCli
+    [switch]$KeepCli,
+    [ValidateSet('en', 'hu')]
+    [string]$Language
 )
 
-$ServiceName     = 'CoworkVMService'
+$ServiceName      = 'CoworkVMService'
 $VerifyTimeoutSec = 30
 $ServiceWaitSec   = 25
+
+# ---------------------------------------------------------------- localisation
+
+if (-not $Language) {
+    $Language = if ((Get-UICulture).TwoLetterISOLanguageName -eq 'hu') { 'hu' } else { 'en' }
+}
+
+# One row per message: en, hu. Everything the user reads comes from here; code
+# and comments stay English-only.
+$Strings = @{
+    'title'        = @('Claude repair', 'Claude javito')
+    'found'        = @('Found', 'Amit talaltam')
+    'package'      = @('Package:  {0}', 'Csomag:   {0}')
+    'notreg'       = @('(not registered)', '(nincs regisztralva)')
+    'status'       = @('Status:   {0}', 'Allapot:  {0}')
+    'aumid'        = @('AUMID:    {0}  [from {1}]', 'AUMID:    {0}  [{1}]')
+    'service'      = @('Service:  {0}', 'Szolg.:   {0}')
+    'svcabsent'    = @('not present', 'nincs telepitve')
+    'targets'      = @('Processes to stop: {0}', 'Leallitando folyamatok: {0}')
+    'signature'    = @('Signature kind: {0}   AllowAllTrustedApps: {1}',
+                       'Alairas tipusa: {0}   AllowAllTrustedApps: {1}')
+    'notset'       = @('(not set)', '(nincs beallitva)')
+    'diagmode'     = @('Diagnose mode - nothing was changed', 'Diagnosztika mod - semmi nem valtozott')
+    'stopsvc'      = @('Stopping the service', 'Szolgaltatas leallitasa')
+    'svcstopped'   = @('Service stopped', 'Szolgaltatas leallitva')
+    'svcalready'   = @('Service already stopped', 'A szolgaltatas mar allt')
+    'svcstopfail'  = @('Could not stop the service: {0}', 'A szolgaltatast nem sikerult leallitani: {0}')
+    'svcstarted'   = @('Service restarted', 'Szolgaltatas ujrainditva')
+    'svcstartfail' = @('Could not restart the service: {0}', 'A szolgaltatast nem sikerult visszainditani: {0}')
+    'svcretry'     = @('Re-registration restarted the service - stopping it again',
+                       'Az ujraregisztralas visszainditotta a szolgaltatast - ujra leallitom')
+    'stopprocs'    = @('Stopping Claude processes', 'Claude folyamatok leallitasa')
+    'terminated'   = @('Stopped {0} process(es)', '{0} folyamat leallitva')
+    'clearlocks'   = @('Clearing stale locks', 'Beragadt lockok torlese')
+    'removed'      = @('Removed {0} stale lock file(s)', '{0} beragadt lock fajl torolve')
+    'starting'     = @('Starting Claude', 'Claude inditasa')
+    'noaumid'      = @('No AUMID - cannot activate the packaged app',
+                       'Nincs AUMID - a csomagolt appot nem tudom inditani')
+    'actfail'      = @('Activation failed: {0}', 'Az inditas nem sikerult: {0}')
+    'notback'      = @('Did not come back - trying to repair the package registration',
+                       'Nem jott fel - megprobalom javitani a csomag regisztraciojat')
+    'reregister'   = @('Re-registering the package', 'Csomag ujraregisztralasa')
+    'reregok'      = @('Package re-registered', 'Csomag ujraregisztralva')
+    'reregfail'    = @('Re-registration failed: {0}', 'Az ujraregisztralas nem sikerult: {0}')
+    'noinstall'    = @('No install location - cannot re-register',
+                       'Nincs telepitesi hely - nem tudom ujraregisztralni')
+    'nomanifest'   = @('Manifest not readable: {0}', 'A manifest nem olvashato: {0}')
+    'identitynow'  = @('Identity now: {0}  AUMID {1}', 'Azonossag most: {0}  AUMID {1}')
+    'done'         = @('DONE - Claude is running again.', 'KESZ - a Claude ujraindult.')
+    'failed'       = @('FAILED - Claude did not come back.', 'NEM SIKERULT - a Claude nem indult el.')
+    'whatnext'     = @('What to try next:', 'Mit erdemes meg probalni:')
+    'advnotreg'    = @('  The package is not registered for this user. Reinstall from claude.ai/download.',
+                       '  A csomag nincs regisztralva ehhez a felhasznalohoz. Telepitsd ujra: claude.ai/download')
+    'advsideload'  = @('  The package is Developer-signed and sideloading is disabled by policy.',
+                       '  A csomag Developer-alairasu, es az oldaltelepites hazirenddel tiltva van.')
+    'advsideload2' = @('  That alone prevents activation - an administrator has to allow trusted apps.',
+                       '  Mar ez megakadalyozza az inditast - a rendszergazdanak engedelyeznie kell.')
+    'advheld'      = @('  Something outside this script is holding the package files - on a managed',
+                       '  Valami ezen a szkripten kivul fogja a csomag fajljait - felugyelt gepen')
+    'advheld2'     = @('  machine that is usually security software. Ask whoever administers it to',
+                       '  ez altalaban biztonsagi szoftver. Kerd meg a rendszergazdat, hogy nezze meg')
+    'advheld3'     = @('  check for handles on {0}.', '  a nyitott hivatkozasokat itt: {0}')
+    'advreboot'    = @('  A reboot clears it in the meantime.', '  Addig a gep ujrainditasa segit.')
+    'reasonmsix'   = @('MSIX package', 'MSIX csomag')
+    'reasonsvc'    = @('cowork service process', 'cowork szolgaltatas folyamat')
+    'reasoncli'    = @('Claude Code CLI', 'Claude Code CLI')
+    'reasonchild'  = @('Claude child process', 'Claude gyerekfolyamat')
+}
+
+function M {
+    param([Parameter(Mandatory)][string]$Key, [object[]]$Args)
+    $row = $Strings[$Key]
+    if (-not $row) { return $Key }
+    $text = if ($Language -eq 'hu' -and $row.Count -gt 1) { $row[1] } else { $row[0] }
+
+    # Explicit count test, not truthiness: a single argument whose value is 0 -
+    # PackageStatus.Ok, for one - makes a one-element array evaluate as false.
+    if ($null -ne $Args -and $Args.Count -gt 0) {
+        return ($text -f ($Args | ForEach-Object { "$_" }))
+    }
+    return $text
+}
 
 function Write-Step { param([string]$Text) Write-Host "`n== $Text" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$Text) Write-Host "   $Text" -ForegroundColor Green }
@@ -64,6 +154,7 @@ function Get-ClaudeIdentity {
         FamilyName      = $null
         InstallLocation = $null
         Status          = $null
+        SignatureKind   = $null
         Aumid           = $null
         AumidSource     = 'none'
     }
@@ -79,6 +170,7 @@ function Get-ClaudeIdentity {
         $result.FamilyName      = $pkg.PackageFamilyName
         $result.InstallLocation = $pkg.InstallLocation
         $result.Status          = $pkg.Status
+        $result.SignatureKind   = $pkg.SignatureKind
     }
 
     # Get-StartApps reports the real AppUserModelId the shell would use.
@@ -89,8 +181,8 @@ function Get-ClaudeIdentity {
         $result.AumidSource = 'Get-StartApps'
     }
     elseif ($result.FamilyName) {
-        # Fall back to the application id declared in the package manifest
-        # rather than assuming a naming convention.
+        # Fall back to the application id declared in the package manifest rather
+        # than assuming a naming convention.
         $manifest = Join-Path $result.InstallLocation 'AppxManifest.xml'
         if (Test-Path $manifest) {
             try {
@@ -105,6 +197,16 @@ function Get-ClaudeIdentity {
     }
 
     return $result
+}
+
+# A Developer-signed package will not activate where sideloading is disabled by
+# policy - common on managed hardware, and invisible from the package's Status.
+function Get-SideloadPolicy {
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+    try {
+        $v = (Get-ItemProperty -Path $key -Name AllowAllTrustedApps -ErrorAction Stop).AllowAllTrustedApps
+        return "$v"
+    } catch { return $null }
 }
 
 # Everything the packaged app writes is redirected here, including the bundled
@@ -154,15 +256,15 @@ function Get-ClaudeTargets {
         $reason = $null
 
         if ($path -and $path -match '\\WindowsApps\\Claude_[^\\]+\\') {
-            $reason = 'MSIX package'
+            $reason = M 'reasonmsix'
         }
         elseif ($p.Name -eq 'cowork-svc.exe') {
-            $reason = 'cowork service process'
+            $reason = M 'reasonsvc'
         }
         elseif ($path -and -not $KeepCli) {
             foreach ($r in $roots) {
                 if ($r -and $path.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) {
-                    $reason = 'Claude Code CLI'
+                    $reason = M 'reasoncli'
                     break
                 }
             }
@@ -196,7 +298,7 @@ function Get-ClaudeTargets {
                     $parent.CreationDate -gt $node.CreationDate) { break }
 
                 if ($targets.ContainsKey($parentId)) {
-                    $targets[$procId] = 'Claude child process'
+                    $targets[$procId] = M 'reasonchild'
                     break
                 }
                 $cursor = $parentId
@@ -211,16 +313,16 @@ function Get-ClaudeTargets {
 
 function Stop-ClaudeService {
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-    if (-not $svc) { Write-Info "$ServiceName not present - skipping"; return $false }
-    if ($svc.Status -eq 'Stopped') { Write-Info 'Service already stopped'; return $true }
+    if (-not $svc) { return $false }
+    if ($svc.Status -eq 'Stopped') { Write-Info (M 'svcalready'); return $true }
 
     try {
         Stop-Service -Name $ServiceName -Force -ErrorAction Stop
         $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($ServiceWaitSec))
-        Write-Ok 'Service stopped'
+        Write-Ok (M 'svcstopped')
         return $true
     } catch {
-        Write-Warn "Could not stop the service: $($_.Exception.Message)"
+        Write-Warn (M 'svcstopfail' @($_.Exception.Message))
         return $false
     }
 }
@@ -230,9 +332,9 @@ function Start-ClaudeService {
     if (-not $svc -or $svc.Status -eq 'Running') { return }
     try {
         Start-Service -Name $ServiceName -ErrorAction Stop
-        Write-Ok 'Service restarted'
+        Write-Ok (M 'svcstarted')
     } catch {
-        Write-Warn "Could not restart the service: $($_.Exception.Message)"
+        Write-Warn (M 'svcstartfail' @($_.Exception.Message))
     }
 }
 
@@ -247,10 +349,10 @@ function Stop-ClaudeProcesses {
         } catch [Microsoft.PowerShell.Commands.ProcessCommandException] {
             # Already gone - stopping the service takes cowork-svc down first.
         } catch {
-            Write-Warn "PID $procId ($($Targets[$procId])): $($_.Exception.Message)"
+            Write-Warn "PID $procId : $($_.Exception.Message)"
         }
     }
-    Write-Ok "Terminated $killed process(es)"
+    Write-Ok (M 'terminated' @($killed))
     return $killed
 }
 
@@ -290,7 +392,7 @@ function Clear-ClaudeLocks {
         }
     }
 
-    Write-Ok "Removed $removed stale lock file(s)"
+    Write-Ok (M 'removed' @($removed))
     return $removed
 }
 
@@ -299,12 +401,12 @@ function Clear-ClaudeLocks {
 function Start-ClaudeApp {
     param($Identity)
 
-    if (-not $Identity.Aumid) { Write-Warn 'No AUMID - cannot activate the packaged app'; return $false }
+    if (-not $Identity.Aumid) { Write-Warn (M 'noaumid'); return $false }
     try {
         Start-Process "shell:AppsFolder\$($Identity.Aumid)" -ErrorAction Stop
         return $true
     } catch {
-        Write-Warn "Activation failed: $($_.Exception.Message)"
+        Write-Warn (M 'actfail' @($_.Exception.Message))
         return $false
     }
 }
@@ -326,70 +428,81 @@ function Wait-ForClaude {
 function Repair-ClaudeRegistration {
     param($Identity)
 
-    if (-not $Identity.InstallLocation) { Write-Warn 'No install location - cannot re-register'; return $false }
+    if (-not $Identity.InstallLocation) { Write-Warn (M 'noinstall'); return $false }
     $manifest = Join-Path $Identity.InstallLocation 'AppxManifest.xml'
-    if (-not (Test-Path $manifest)) { Write-Warn "Manifest not readable: $manifest"; return $false }
+    if (-not (Test-Path $manifest)) { Write-Warn (M 'nomanifest' @($manifest)); return $false }
 
     try {
         Add-AppxPackage -Register $manifest -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop
-        Write-Ok 'Package re-registered'
-        return $true
+        Write-Ok (M 'reregok')
     } catch {
-        Write-Warn "Re-registration failed: $($_.Exception.Message)"
+        Write-Warn (M 'reregfail' @($_.Exception.Message))
         return $false
     }
+
+    # Re-registering the package starts its service again, and that service is
+    # exactly what holds the package files. Without stopping it here the next
+    # activation attempt is blocked by the repair we just performed.
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($svc -and $svc.Status -ne 'Stopped') {
+        Write-Info (M 'svcretry')
+        $null = Stop-ClaudeService
+    }
+
+    return $true
 }
 
 # ---------------------------------------------------------------- main
 
-Write-Host "Claude repair - https://github.com/pichaccu/claude-unstick-windows"
+Write-Host (M 'title') -NoNewline
+Write-Host ' - https://github.com/pichaccu/claude-unstick-windows'
 
 $identity = Get-ClaudeIdentity
+$sideload = Get-SideloadPolicy
 
-Write-Step 'Found'
-Write-Info "Package:  $(if ($identity.PackageFullName) { $identity.PackageFullName } else { '(not registered)' })"
-Write-Info "Status:   $($identity.Status)"
-Write-Info "AUMID:    $($identity.Aumid)  [from $($identity.AumidSource)]"
+Write-Step (M 'found')
+Write-Info (M 'package' @($(if ($identity.PackageFullName) { $identity.PackageFullName } else { M 'notreg' })))
+Write-Info (M 'status'  @($identity.Status))
+Write-Info (M 'aumid'   @($identity.Aumid, $identity.AumidSource))
 $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-Write-Info "Service:  $(if ($svc) { "$($svc.Status) (CanStop=$($svc.CanStop))" } else { 'not present' })"
+Write-Info (M 'service' @($(if ($svc) { "$($svc.Status) (CanStop=$($svc.CanStop))" } else { M 'svcabsent' })))
+Write-Info (M 'signature' @($identity.SignatureKind, $(if ($null -ne $sideload) { $sideload } else { M 'notset' })))
 
 $targets = Get-ClaudeTargets -Identity $identity
-Write-Info "Processes to stop: $($targets.Count)"
+Write-Info (M 'targets' @($targets.Count))
 foreach ($procId in ($targets.Keys | Sort-Object)) {
     $p = Get-Process -Id $procId -ErrorAction SilentlyContinue
     Write-Info "   [$procId] $(if ($p) { $p.ProcessName } else { '?' }) - $($targets[$procId])"
 }
 
 if ($Diagnose) {
-    Write-Step 'Diagnose mode - nothing was changed'
-    if (-not $identity.PackageFullName) {
-        Write-Warn 'No registered Claude package. Reinstall from claude.ai/download.'
-    }
+    Write-Step (M 'diagmode')
+    if (-not $identity.PackageFullName) { Write-Warn (M 'advnotreg') }
     return
 }
 
-Write-Step 'Stopping the service'
+Write-Step (M 'stopsvc')
 $serviceWasPresent = $null -ne $svc
 $null = Stop-ClaudeService
 
-Write-Step 'Stopping Claude processes'
+Write-Step (M 'stopprocs')
 $null = Stop-ClaudeProcesses -Targets $targets
 
-Write-Step 'Clearing stale locks'
+Write-Step (M 'clearlocks')
 $null = Clear-ClaudeLocks -Identity $identity
 
-Write-Step 'Starting Claude'
+Write-Step (M 'starting')
 $recovered = $false
 
 if ((Start-ClaudeApp -Identity $identity) -and (Wait-ForClaude)) {
     $recovered = $true
 } else {
-    Write-Warn 'Did not come back - trying to repair the package registration'
+    Write-Warn (M 'notback')
 
-    Write-Step 'Re-registering the package'
+    Write-Step (M 'reregister')
     if (Repair-ClaudeRegistration -Identity $identity) {
         $identity = Get-ClaudeIdentity
-        Write-Info "Identity now: $($identity.PackageFullName)  AUMID $($identity.Aumid)"
+        Write-Info (M 'identitynow' @($identity.PackageFullName, $identity.Aumid))
         if ((Start-ClaudeApp -Identity $identity) -and (Wait-ForClaude)) { $recovered = $true }
     }
 }
@@ -398,19 +511,25 @@ if ($serviceWasPresent) { Start-ClaudeService }
 
 Write-Host ''
 if ($recovered) {
-    Write-Host 'DONE - Claude is running again.' -ForegroundColor Green
+    Write-Host (M 'done') -ForegroundColor Green
     exit 0
 }
 
-Write-Host 'FAILED - Claude did not come back.' -ForegroundColor Red
+Write-Host (M 'failed') -ForegroundColor Red
 Write-Host ''
-Write-Host 'What to try next:'
+Write-Host (M 'whatnext')
+
 if (-not $identity.PackageFullName) {
-    Write-Host '  The package is not registered for this user. Reinstall from claude.ai/download.'
-} else {
-    Write-Host '  Something outside this script is holding the package files - on a managed'
-    Write-Host '  machine that is usually security software. Ask whoever administers it to'
-    Write-Host "  check for handles on $($identity.InstallLocation)."
-    Write-Host '  A reboot clears it in the meantime.'
+    Write-Host (M 'advnotreg')
+}
+elseif ($identity.SignatureKind -eq 'Developer' -and $sideload -eq '0') {
+    Write-Host (M 'advsideload')
+    Write-Host (M 'advsideload2')
+}
+else {
+    Write-Host (M 'advheld')
+    Write-Host (M 'advheld2')
+    Write-Host (M 'advheld3' @($identity.InstallLocation))
+    Write-Host (M 'advreboot')
 }
 exit 1
